@@ -33,14 +33,12 @@ class JoinFilter:
 
     def _handle_sigterm(self, signum, frame):
         logging.info(
-            "[JoinFilter] SIGTERM/SIGINT received. Closing connections gracefully..."
+            "[JoinFilter] SIGTERM/SIGINT received. Stopping consumption loop..."
         )
         try:
-            self.input_queue.close()
-            self.output_queue.close()
+            self.input_queue.stop_consuming()
         except Exception as e:
-            logging.error(f"[JoinFilter] Error closing connections: {e}")
-        sys.exit(0)
+            logging.error(f"[JoinFilter] Error stopping consumption: {e}")
 
     def _process_client_top(self, client_id, partial_top):
         if client_id not in self.fruit_top_by_client:
@@ -92,11 +90,26 @@ class JoinFilter:
     def start(self):
         self.input_queue.start_consuming(self.process_messsage)
 
+    def close(self):
+        logging.info("[JoinFilter] Closing network connections...")
+        try:
+            self.input_queue.close()
+        except Exception as e:
+            logging.error(f"[JoinFilter] Error closing input queue: {e}")
+
+        try:
+            self.output_queue.close()
+        except Exception as e:
+            logging.error(f"[JoinFilter] Error closing output queue: {e}")
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     join_filter = JoinFilter()
-    join_filter.start()
+    try:
+        join_filter.start()
+    finally:
+        join_filter.close()
 
     return 0
 
