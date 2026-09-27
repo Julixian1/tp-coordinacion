@@ -159,6 +159,15 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError(f"Error de conexión al detener: {e}")
 
+    def stop_consuming_threadsafe(self):
+        try:
+            if self.connection and self.connection.is_open:
+                self.connection.add_callback_threadsafe(self.stop_consuming)
+        except pika.exceptions.AMQPConnectionError as e:
+            raise MessageMiddlewareDisconnectedError(f"Error de conexión al detener thread-safe: {e}")
+        except Exception as e:
+            raise MessageMiddlewareMessageError(f"Error interno al detener thread-safe: {e}")
+
     def send(self, message):
         try:
             for rk in self.routing_keys:
