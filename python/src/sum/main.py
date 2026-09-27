@@ -127,31 +127,30 @@ class SumFilter:
         self.control_thread.start()
         self.input_queue.start_consuming(self.process_data_messsage)
 
+    def _safe_close(self, resource, name: str) -> None:
+        if resource is None:
+            return
+        try:
+            resource.close()
+        except Exception as e:
+            logging.error(f"[SumFilter {ID}] Error closing {name}: {e}")
+
     def close(self):
         logging.info(f"[SumFilter {ID}] Closing network connections...")
         if self.control_thread and self.control_thread.is_alive():
             self.control_thread.join(timeout=2.0)
 
-        try:
-            self.input_queue.close()
-        except Exception as e:
-            logging.error(f"[SumFilter {ID}] Error closing input_queue: {e}")
+        resources_to_close = [
+            (self.input_queue, "input_queue"),
+            (self.control_listener, "control_listener"),
+            (self.control_sender, "control_sender"),
+        ]
 
-        try:
-            self.control_listener.close()
-        except Exception as e:
-            logging.error(f"[SumFilter {ID}] Error closing control_listener: {e}")
-
-        try:
-            self.control_sender.close()
-        except Exception as e:
-            logging.error(f"[SumFilter {ID}] Error closing control_sender: {e}")
+        for resource, name in resources_to_close:
+            self._safe_close(resource, name)
 
         for i, out_exchange in enumerate(self.data_output_exchanges):
-            try:
-                out_exchange.close()
-            except Exception as e:
-                logging.error(f"[SumFilter {ID}] Error closing data_output_exchange_{i}: {e}")
+            self._safe_close(out_exchange, f"data_output_exchange_{i}")
 
 def main():
     logging.basicConfig(level=logging.INFO)
