@@ -36,22 +36,23 @@ class SumFilter:
 
         self.amount_by_client = {}
         self.lock = threading.Lock()
+        self.control_thread = None
         signal.signal(signal.SIGTERM, self._handle_sigterm)
         signal.signal(signal.SIGINT, self._handle_sigterm)
 
     def _handle_sigterm(self, signum, frame):
         logging.info(
-            f"[SumFilter {ID}] SIGTERM received. Closing connections gracefully..."
+            f"[SumFilter {ID}] SIGTERM/SIGINT received. Stopping consumption loops..."
         )
         try:
-            self.input_queue.close()
-            self.control_listener.close()
-            self.control_sender.close()
-            for out_exchange in self.data_output_exchanges:
-                out_exchange.close()
+            self.input_queue.stop_consuming()
         except Exception as e:
-            logging.error(f"[SumFilter {ID}] Error closing connections: {e}")
-        sys.exit(0)
+            logging.error(f"[SumFilter {ID}] Error stopping input queue: {e}")
+
+        try:
+            self.control_listener.stop_consuming_threadsafe()
+        except Exception as e:
+            logging.error(f"[SumFilter {ID}] Error stopping control listener: {e}")
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f" [Client {client_id}] Process data")
@@ -117,19 +118,48 @@ class SumFilter:
         ack()
 
     def start(self):
-        control_thread = threading.Thread(
+        self.control_thread = threading.Thread(
             target=lambda: self.control_listener.start_consuming(
                 self.process_control_message
             ),
             daemon=True,
         )
-        control_thread.start()
+        self.control_thread.start()
         self.input_queue.start_consuming(self.process_data_messsage)
+
+    def close(self):
+        logging.info(f"[SumFilter {ID}] Closing network connections...")
+        if self.control_thread and self.control_thread.is_alive():
+            self.control_thread.join(timeout=2.0)
+
+        try:
+            self.input_queue.close()
+        except Exception as e:
+            logging.error(f"[SumFilter {ID}] Error closing input_queue: {e}")
+
+        try:
+            self.control_listener.close()
+        except Exception as e:
+            logging.error(f"[SumFilter {ID}] Error closing control_listener: {e}")
+
+        try:
+            self.control_sender.close()
+        except Exception as e:
+            logging.error(f"[SumFilter {ID}] Error closing control_sender: {e}")
+
+        for i, out_exchange in enumerate(self.data_output_exchanges):
+            try:
+                out_exchange.close()
+            except Exception as e:
+                logging.error(f"[SumFilter {ID}] Error closing data_output_exchange_{i}: {e}")
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    try:
+        sum_filter.start()
+    finally:
+        sum_filter.close()
     return 0
 
 
