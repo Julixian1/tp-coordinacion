@@ -35,11 +35,9 @@ class AggregationFilter:
             f"[AggregationFilter {ID}] SIGTERM received. Closing connections..."
         )
         try:
-            self.input_exchange.close()
-            self.output_queue.close()
+            self.input_exchange.stop_consuming()
         except Exception as e:
-            logging.error(f"[AggregationFilter {ID}] Error closing connections: {e}")
-        sys.exit(0)
+            logging.error(f"[AggregationFilter {ID}] Error stopping consumption: {e}")
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"[Client {client_id}]Processing data message")
@@ -86,10 +84,25 @@ class AggregationFilter:
     def start(self):
         self.input_exchange.start_consuming(self.process_messsage)
 
+    def close(self):
+        logging.info(f"[AggregationFilter {ID}] Closing network connections...")
+        try:
+            self.input_exchange.close()
+        except Exception as e:
+            logging.error(f"[AggregationFilter {ID}] Error closing input exchange: {e}")
+
+        try:
+            self.output_queue.close()
+        except Exception as e:
+            logging.error(f"[AggregationFilter {ID}] Error closing output queue: {e}")
+
 def main():
     logging.basicConfig(level=logging.INFO)
     aggregation_filter = AggregationFilter()
-    aggregation_filter.start()
+    try:
+        aggregation_filter.start()
+    finally:
+        aggregation_filter.close()
     return 0
 
 
