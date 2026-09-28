@@ -81,9 +81,10 @@ class SumFilter:
             client_fruits = self.amount_by_client.get(client_id, {})
 
             for final_fruit_item in client_fruits.values():
-                fruit_bytes = final_fruit_item.fruit.encode("utf-8")
+                routing_key = f"{client_id}_{final_fruit_item.fruit}"
+                routing_bytes = routing_key.encode("utf-8")
                 aggregator_idx = (
-                    int(hashlib.md5(fruit_bytes).hexdigest(), 16)
+                    int(hashlib.md5(routing_bytes).hexdigest(), 16)
                     % AGGREGATION_AMOUNT
                 )
                 target_exchange = self.data_output_exchanges[aggregator_idx]
