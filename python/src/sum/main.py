@@ -16,6 +16,9 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+MSG_PREPARE = "PREPARE"
+MSG_COUNT = "COUNT"
+
 class SumFilter:
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -35,6 +38,10 @@ class SumFilter:
             self.data_output_exchanges.append(data_output_exchange)
 
         self.amount_by_client = {}
+        self.msg_count_by_client = {} 
+        self.expected_by_client = {}   
+        self.received_by_client = {}
+
         self.lock = threading.Lock()
         self.control_thread = None
         signal.signal(signal.SIGTERM, self._handle_sigterm)
@@ -54,69 +61,87 @@ class SumFilter:
         except Exception as e:
             logging.error(f"[SumFilter {ID}] Error stopping control listener: {e}")
 
+    def _send_count(self, client_id, count):
+        self.control_sender.send(
+            message_protocol.internal.serialize([MSG_COUNT, client_id, count])
+        )
+
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f" [Client {client_id}] Process data")
         with self.lock:
-            if client_id not in self.amount_by_client:
-                self.amount_by_client[client_id] = {}
-
-            client_fruits = self.amount_by_client[client_id]
-
+            client_fruits = self.amount_by_client.setdefault(client_id, {})
             client_fruits[fruit] = client_fruits.get(
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
 
-    def _handle_gateway_eof(self, client_id):
+            self.msg_count_by_client[client_id] = (
+                self.msg_count_by_client.get(client_id, 0) + 1
+            )
+            if client_id in self.expected_by_client:
+                self._send_count(client_id, 1)
+
+    def _handle_gateway_eof(self, client_id, total_expected):
         logging.info(
-            f"[SumFilter {ID}] Received raw EOF from Gateway for client {client_id}. Broadcasting CONTROL_EOF."
+            f"[SumFilter {ID}] EOF from Gateway, client {client_id}, N={total_expected}"
         )
         with self.lock:
             self.control_sender.send(
-                message_protocol.internal.serialize([client_id])
+                message_protocol.internal.serialize(
+                    [MSG_PREPARE, client_id, int(total_expected)]
+                )
             )
-
-    def _process_broadcast_eof(self, client_id):
-        logging.info(f" [Client {client_id}] Broadcasting data messages")
+    
+    def _process_prepare(self, client_id, total_expected):
         with self.lock:
-            client_fruits = self.amount_by_client.get(client_id, {})
+            self.expected_by_client[client_id] = int(total_expected)
+            mine = self.msg_count_by_client.get(client_id, 0)
+            if mine > 0:
+                self._send_count(client_id, mine)
+                
+            if self.received_by_client.get(client_id, 0) == self.expected_by_client[client_id]:
+                self._flush_data_and_eof(client_id)
 
-            for final_fruit_item in client_fruits.values():
-                routing_key = f"{client_id}_{final_fruit_item.fruit}"
-                routing_bytes = routing_key.encode("utf-8")
-                aggregator_idx = (
-                    int(hashlib.md5(routing_bytes).hexdigest(), 16)
-                    % AGGREGATION_AMOUNT
-                )
-                target_exchange = self.data_output_exchanges[aggregator_idx]
-                target_exchange.send(
-                    message_protocol.internal.serialize(
-                        [
-                            client_id,
-                            final_fruit_item.fruit,
-                            final_fruit_item.amount,
-                        ]
-                    )
-                )
-            logging.info(f"Broadcasting EOF message")
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+    def _flush_data_and_eof(self, client_id):
+        logging.info(f"[SumFilter {ID}] Flushing client {client_id} to Aggregators")
+        client_fruits = self.amount_by_client.pop(client_id, {})
+        self.expected_by_client.pop(client_id, None)
+        self.msg_count_by_client.pop(client_id, None)
+        self.received_by_client.pop(client_id, None)
 
-            if client_id in self.amount_by_client:
-                del self.amount_by_client[client_id]
+        for item in client_fruits.values():
+            routing_key = f"{client_id}_{item.fruit}"
+            idx = int(hashlib.md5(routing_key.encode("utf-8")).hexdigest(), 16) % AGGREGATION_AMOUNT
+            self.data_output_exchanges[idx].send(
+                message_protocol.internal.serialize([client_id, item.fruit, item.amount])
+            )
+        for exchange in self.data_output_exchanges:
+            exchange.send(message_protocol.internal.serialize([client_id]))
+    
+    def _process_count(self, client_id, count):
+        with self.lock:
+            self.received_by_client[client_id] = (
+                self.received_by_client.get(client_id, 0) + int(count)
+            )
+            if (client_id in self.expected_by_client
+                    and self.received_by_client[client_id] == self.expected_by_client[client_id]):
+                self._flush_data_and_eof(client_id)
+
+    def process_control_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        if fields[0] == MSG_PREPARE:
+            self._process_prepare(fields[1], fields[2])
+        elif fields[0] == MSG_COUNT:
+            self._process_count(fields[1], fields[2])
+        ack()
+
 
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
-        elif len(fields) == 1:
+        elif len(fields) == 2:
             self._handle_gateway_eof(*fields)
         ack()
 
-    def process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 1:
-            self._process_broadcast_eof(fields[0])
-        ack()
 
     def start(self):
         self.control_thread = threading.Thread(
