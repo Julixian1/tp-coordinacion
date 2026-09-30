@@ -15,25 +15,36 @@ La arquitectura se diseña como una tubería (*pipeline*) de cuatro etapas desac
 
 ## 2. Coordinación y Flujo de Etapas
 
-### 2.1. Ingesta y Acumulación en `SumFilter`
-El `Gateway` deposita los registros entrantes en la cola compartida `INPUT_QUEUE`. Múltiples instancias de `Sum` consumen de esta cola bajo el patrón de **consumidores competidores** (*competing consumers*).
+### 2.2. Sincronización del fin de ingesta (`Sum` → `Aggregation`)
 
-Cada nodo `Sum` mantiene en memoria un mapa de dos niveles indexado por `client_id`:
+Los datos de un cliente se reparten entre las `S` instancias de `Sum` por una cola
+compartida, pero el `EOF` lo consume una sola. Esa instancia no puede enviar datos en ese
+momento: otra podría tener un dato de ese cliente ya entregado y todavía sin procesar,
+y un envio anticipado lo perdería. Tampoco alcanza con un broadcast del EOF, porque
+viaja por un canal distinto al de los datos y no hay orden entre ambos.
 
-$$\text{amount\_by\_client} = \{ \text{client\_id}: \{ \text{fruta}: \text{FruitItem} \} \}$$
+**Conteo de mensajes.** El `message_handler` del gateway cuenta los mensajes de datos de
+cada cliente y el `EOF` lleva ese total `N`: `[client_id, N]`. Con eso, cada `Sum`
+puede comprobar si ya se sumaron todos los datos, en lugar de suponerlo.
 
-La acumulación de valores utiliza el operador `+` de la clase `FruitItem`, respetando la naturaleza opaca de la lógica de negocio.
+**Protocolo** (sobre `SUM_CONTROL_EXCHANGE`, de tipo topic; cada `Sum` tiene su cola):
 
-### 2.2. Sincronización de EOF mediante Broadcast (`Sum` $\rightarrow$ `Aggregation`)
-Dado que la ingesta de un cliente se distribuye entre $N$ nodos `Sum`, **únicamente uno de ellos recibe la señal de `EOF` enviada por el `Gateway`**. Para coordinar el cierre global de la primera etapa sin recurrir a un nodo maestro centralizado:
+1. El `Sum` que consume el `EOF` publica `PREPARE(client_id, N)`. Llega a todos, incluido él.
+2. Cada `Sum`, al recibir el `PREPARE`:
+   - guarda `N` para ese cliente;
+   - publica `COUNT(client_id, c)`, con `c` la cantidad de mensajes de ese cliente que ya
+     sumó en su diccionario (si `c > 0`).
+3. Si después llega un dato de ese cliente a un `Sum` que ya vio el `PREPARE`, lo suma y
+   publica `COUNT(client_id, 1)`.
+4. Cada `Sum` acumula todos los `COUNT` que recibe, incluidos los propios (los escucha
+   por el mismo exchange). Cuando `suma de COUNT == N` envía cada
+   `FruitItem` al aggregator que le corresponde por hash y un `EOF` a todos los aggregators.
 
-1. El nodo `Sum` que detecta el `EOF` del cliente envía un mensaje de control al *Exchange Fanout* `SUM_CONTROL_EXCHANGE`.
-2. **Todas las instancias de `Sum`** escuchan en este canal a través de un hilo secundario dedicado (`control_listener`).
-3. Al recibir la notificación, cada instancia de `Sum`:
-   - Realiza el *flush* de su diccionario local acumulado para ese `client_id`.
-   - Rutea cada `FruitItem` hacia el `Aggregation` correspondiente usando **particionamiento por Hash**.
-   - Notifica el fin de su transmisión enviando un `EOF` individual a **cada uno** de los `data_output_exchanges` conectados a los agregadores.
-   - Elimina de memoria el estado asociado al `client_id`.
+**Concurrencia.** Hay dos hilos por `Sum`: el principal (datos) y el de control
+(`PREPARE` y `COUNT`). El estado por cliente se protege con un `Lock`. Las conexiones de
+Pika no son thread-safe, así que los `data_output_exchanges` los usa solo el hilo de
+control (quien envía a aggregators), y `control_sender`, compartido, se usa siempre con el lock tomado.
+
 
 ### 2.3. Barrera de Sincronización en `AggregationFilter`
 Cada nodo `Aggregation` mantiene en memoria una lista ordenada por cliente utilizando el módulo `bisect` y un contador de señales de finalización (`eof_count_by_client`).
@@ -84,7 +95,7 @@ Los mensajes de datos y de control transportan el metadato `client_id` (key). Co
 
 ### 4.2. Escalado por Volumen de Datos
 El sistema maneja un alto volumen de datos mediante la reducción por etapas:
-* **Etapa de Ingesta (`Sum`):** Permite agregar más nodos en paralelo (*escalabilidad horizontal*) para procesar un volumen alto de datos. Además, cada nodo suma en su memoria local todas las repeticiones de una misma fruta antes de enviarla. De esta forma se envía un único mensaje consolidado por fruta.
+* **Etapa de Ingesta (`Sum`):** Permite agregar más nodos en paralelo (*escalabilidad horizontal*). Además, cada nodo suma en su memoria local todas las repeticiones de una misma fruta antes de enviarla. De esta forma se envía un único mensaje consolidado por fruta.
 * **Etapa de Agregación (`Aggregation`):** La función de hash reparte las frutas entre las $M$ instancias de `Aggregation`, dividiendo el trabajo de ordenamiento y el cálculo del Top.
 
 ### 4.3. Parametrización de la Topología
@@ -117,6 +128,6 @@ File "//main.py", line 35, in disconnect
   self.server_socket.shutdown(socket.SHUT_RDWR)
 OSError: [Errno 107] Socket not connected
 ```
-Y al gateway no le llegaba ningún mensaje. Dado que el código del cliente de pruebas no es modificable, la hipótesis de este comportamiento radica en una condición de carrera (race condition) durante la etapa de arranque (startup). Si un cliente intenta ejecutar la llamada a connect() antes de que el proceso del Gateway haya terminado de inicializarse y abrir su socket, la conexión falla al inicio. Posteriormente, cuando el flujo interno del cliente ejecuta la limpieza en el bloque final llamando a client.disconnect(), se invoca shutdown() sobre un socket que nunca llegó a establecer una conexión TCP. Esto provoca que el sistema operativo lance la excepción OSError: [Errno 107] Socket not connected
+Y al gateway no le llegaba ningún mensaje. Dado que el código del cliente de pruebas no es modificable, la hipótesis de este comportamiento radica en una condición de carrera durante la etapa de arranque (startup). Si un cliente intenta ejecutar la llamada a connect() antes de que el proceso del Gateway haya terminado de inicializarse y abrir su socket, la conexión falla al inicio. Posteriormente, cuando el cliente ejecuta la limpieza en el bloque final llamando a client.disconnect(), se invoca shutdown() sobre un socket que nunca llegó a establecer una conexión TCP. Esto provoca que el sistema operativo lance la excepción OSError: [Errno 107] Socket not connected
 
 Se comprobó que, implementando políticas de reintento de conexión a nivel de red, la condición de carrera desaparece por completo y las pruebas se ejecutan bien.
