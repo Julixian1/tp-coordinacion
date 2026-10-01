@@ -15,35 +15,61 @@ La arquitectura se diseña como una tubería (*pipeline*) de cuatro etapas desac
 
 ## 2. Coordinación y Flujo de Etapas
 
+### 2.1. Ingesta y acumulación en `Sum`
+
+El `Gateway` deposita los registros en la cola compartida `INPUT_QUEUE`. Las `S` instancias de
+`Sum` consumen de ella como **consumidores competidores**, con `prefetch_count=1`.
+
+El `message_handler` del gateway **cuenta los mensajes de datos de cada cliente** y el `EOF`
+transporta ese total: `[client_id, N]`.
+
+Cada `Sum` mantiene en memoria, por `client_id`, un diccionario `{fruta: FruitItem}` y un
+contador de los mensajes que sumó. La acumulación usa el operador `+` de `FruitItem`, sin
+asumir su implementación.
+
 ### 2.2. Sincronización del fin de ingesta (`Sum` → `Aggregation`)
 
-Los datos de un cliente se reparten entre las `S` instancias de `Sum` por una cola
-compartida, pero el `EOF` lo consume una sola. Esa instancia no puede enviar datos en ese
-momento: otra podría tener un dato de ese cliente ya entregado y todavía sin procesar,
-y un envio anticipado lo perdería. Tampoco alcanza con un broadcast del EOF, porque
-viaja por un canal distinto al de los datos y no hay orden entre ambos.
+Los datos de un cliente se reparten entre las `S` instancias por una cola compartida, pero el
+`EOF` lo consume una sola. Esa instancia no puede enviar sus resultados en ese momento: otra
+podría tener un dato de ese cliente ya entregado y todavía sin procesar, y un envío anticipado
+lo perdería. Un broadcast simple del EOF tampoco alcanza, porque viaja por un canal distinto al
+de los datos y no hay orden entre ambos.
 
-**Conteo de mensajes.** El `message_handler` del gateway cuenta los mensajes de datos de
-cada cliente y el `EOF` lleva ese total `N`: `[client_id, N]`. Con eso, cada `Sum`
-puede comprobar si ya se sumaron todos los datos, en lugar de suponerlo.
+**Idea.** Gracias al total `N`, cada instancia puede *comprobar* que ya se procesaron todos los
+datos, en lugar de suponerlo. Las instancias se coordinan por `SUM_CONTROL_EXCHANGE` (exchange
+`topic`). 
+El `Sum` que consume el `EOF` actúa como **coordinador de ese cliente**; el rol rota según quién
+lo consuma, por lo que no hay un nodo maestro fijo.
 
-**Protocolo** (sobre `SUM_CONTROL_EXCHANGE`, de tipo topic; cada `Sum` tiene su cola):
+**Protocolo:**
 
-1. El `Sum` que consume el `EOF` publica `PREPARE(client_id, N)`. Llega a todos, incluido él.
-2. Cada `Sum`, al recibir el `PREPARE`:
-   - guarda `N` para ese cliente;
-   - publica `COUNT(client_id, c)`, con `c` la cantidad de mensajes de ese cliente que ya
-     sumó en su diccionario (si `c > 0`).
-3. Si después llega un dato de ese cliente a un `Sum` que ya vio el `PREPARE`, lo suma y
-   publica `COUNT(client_id, 1)`.
-4. Cada `Sum` acumula todos los `COUNT` que recibe, incluidos los propios (los escucha
-   por el mismo exchange). Cuando `suma de COUNT == N` envía cada
-   `FruitItem` al aggregator que le corresponde por hash y un `EOF` a todos los aggregators.
+1. **`PREPARE(client_id, N, coordinador)`**: lo publica por broadcast el `Sum` que consumió el `EOF`.
+2. Cada `Sum`, al recibir el `PREPARE`, recuerda quién es el coordinador y le envía
+   **`COUNT(client_id, c)`**, con `c` la cantidad de mensajes de ese cliente que ya sumó
+   (solo si `c > 0`). El coordinador además guarda `N`.
+3. Si después le llega un dato de ese cliente a un `Sum` que ya vio el `PREPARE`, lo suma y envía
+   `COUNT(client_id, 1)` al coordinador.
+4. El coordinador acumula los `COUNT`. Cuando la suma es igual a `N`, publica por broadcast
+   **`FLUSH(client_id)`**.
+5. Cada `Sum`, al recibir el `FLUSH`, envía cada `FruitItem` al aggregator que le corresponde.
 
-**Concurrencia.** Hay dos hilos por `Sum`: el principal (datos) y el de control
-(`PREPARE` y `COUNT`). El estado por cliente se protege con un `Lock`. Las conexiones de
-Pika no son thread-safe, así que los `data_output_exchanges` los usa solo el hilo de
-control (quien envía a aggregators), y `control_sender`, compartido, se usa siempre con el lock tomado.
+- Cada dato se cuenta exactamente una vez: o queda incluido en el `c` del `PREPARE` o se informa como `+1`. Ambas decisiones se toman bajo el mismo `Lock` que protege el diccionario y los contadores.
+- El contador se incrementa *después* de sumar el dato, así que todo mensaje contado ya está en un diccionario.
+- Los conteos solo crecen. Si la suma llega a `N`, todos los datos ya fueron sumados y ninguno puede llegar después. Si hay un dato que falta procesar, la suma da menos que `N`; cuando ese `Sum` lo procese enviará su `+1` y el coordinador volverá a evaluar. No hay polling, sleeps ni reintentos.
+- El coordinador borra su estado antes de emitir el `FLUSH`, por lo que no puede emitirlo dos veces. Un `COUNT` ajeno que llegue antes que su `PREPARE` se acumula y se revisa al llegar este, de modo que el orden entre ambos es irrelevante.
+- Al terminar, ningún `Sum` conserva estado del cliente.
+
+**Concurrencia.** Cada `Sum` tiene dos hilos: el principal (datos) y el de control. El estado por
+cliente se protege con un `Lock` global. Como Pika no es thread-safe, los `data_output_exchanges`
+los usa únicamente el hilo de control (quien envía a los aggregators), y `control_sender`, que
+usan ambos hilos, se utiliza siempre con el lock tomado.
+
+**Costo del protocolo de control.** Por cliente: un `PREPARE` (broadcast, `S` entregas), a lo sumo
+`S` `COUNT` dirigidos a un único nodo, más a lo sumo `S-1` `COUNT` por datos que lleguen tras el
+`PREPARE` (con `prefetch_count=1`, cada `Sum` tiene a lo sumo un mensaje en proceso), y un
+`FLUSH` (broadcast). Es **`O(S)`** y **no depende del volumen de datos**. El precio es una ronda
+extra de latencia (`PREPARE → COUNT → FLUSH`). Se descartó un esquema donde cada `Sum` difunde su
+`COUNT` a todos los demás por ser `O(S²)` en réplicas.
 
 
 ### 2.3. Barrera de Sincronización en `AggregationFilter`
@@ -72,12 +98,10 @@ aggregator_idx = int(hashlib.md5(fruit_bytes).hexdigest(), 16) % AGGREGATION_AMO
 Para distribuir el trabajo entre la etapa de acumulación (`Sum`) y la de agregación (`Aggregation`), fue necesario definir la clave para la función de hash. Se analizaron dos alternativas principales:
 
 * **Opción A: Hash por `Client_ID + Fruta` (Seleccionada)**
-  * **Cómo funciona:** La clave combina el ID del cliente y la fruta (`f"{client_id}_{fruit}"`).
   * **Ventaja:** Reparte la carga de forma pareja entre todos los agregadores. Evita que un agregador se sature si una fruta es muy vendida.
   * **Desventaja:** Requiere combinar dos campos para armar la clave.
 
 * **Opción B: Hash solo por `Fruta`**
-  * **Cómo funciona:** Todos los datos de una misma fruta van al mismo agregador.
   * **Ventaja:** Agrupa toda la información de cada fruta en un único nodo.
   * **Desventaja:** Riesgo alto de sobrecargar un solo nodo (*data skew*) si una fruta domina el volumen de ventas.
 
@@ -85,7 +109,7 @@ Para distribuir el trabajo entre la etapa de acumulación (`Sum`) y la de agrega
 
 Se eligió la **Opción A (`Client_ID + Fruta`)** por las siguientes razones:
 1. **Evita cuellos de botella:** Previene que una fruta "popular" llene la memoria o sobrecargue la red de un solo agregador.
-2. **Uso parejo de recursos:** Todos los contenedores de agregación procesan una cantidad similar de trabajo.
+2. **Uso parejo de recursos:** Se busca que todos los contenedores de agregación procesan una cantidad similar de trabajo.
 3. **Sin costo extra:** El nodo `Joiner` igual tenía que esperar la respuesta de los $M$ agregadores por cada cliente, por lo que este reparto no agrega complejidad ni demoras al flujo de datos
 
 ## 4. Escalabilidad y Flexibilidad
@@ -115,7 +139,7 @@ Todos los componentes registran manejadores de señales para `SIGTERM` y `SIGINT
    self.connection.add_callback_threadsafe(self.stop_consuming)
    ``` 
 Esto permite programar la orden de detención como un callback dentro del propio event loop del hilo secundario, garantizando un apagado limpio y libre de condiciones de carrera.
-3. **Liberación de conexiones:** Se realiza el cierre explícito de sockets, colas y exchanges dentro de bloques `finally` e invocaciones a `close()`, garantizando que no queden conexiones TCP hurgando o recursos bloqueados en el middleware.
+3. **Liberación de conexiones:** Se realiza el cierre explícito de sockets, colas y exchanges dentro de bloques `finally` e invocaciones a `close()`, garantizando que no queden conexiones TCP o recursos bloqueados en el middleware.
 
 #### Diagnóstico de Fallos en Pruebas: Desconexión del Cliente (`Errno 107`)
 
