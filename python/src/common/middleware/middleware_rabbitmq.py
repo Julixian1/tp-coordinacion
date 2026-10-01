@@ -184,6 +184,19 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         except Exception as e:
             raise MessageMiddlewareMessageError(f"Error enviando mensaje: {e}")
 
+    def send_with_key(self, routing_key, message):
+        try:
+            self.channel.basic_publish(
+                exchange=self.exchange_name,
+                routing_key=routing_key,
+                body=message,
+                properties=pika.BasicProperties(delivery_mode=pika.DeliveryMode.Persistent),
+            )
+        except pika.exceptions.AMQPConnectionError as e:
+            raise MessageMiddlewareDisconnectedError(f"Error de conexión enviando: {e}")
+        except Exception as e:
+            raise MessageMiddlewareMessageError(f"Error enviando mensaje: {e}")
+
     def close(self):
         try:
             if self.channel and self.channel.is_open:
