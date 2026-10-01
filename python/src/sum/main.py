@@ -16,8 +16,12 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+BROADCAST_KEY = "sum_control.all"
+MY_KEY = f"sum_control.{ID}"
+
 MSG_PREPARE = "PREPARE"
 MSG_COUNT = "COUNT"
+MSG_FLUSH = "FLUSH"
 
 class SumFilter:
     def __init__(self):
@@ -25,10 +29,10 @@ class SumFilter:
             MOM_HOST, INPUT_QUEUE
         )
         self.control_listener = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["sum_control.*"]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [BROADCAST_KEY, MY_KEY]
         )
         self.control_sender = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, ["sum_control.eof"]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [BROADCAST_KEY]
         )
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
@@ -41,6 +45,7 @@ class SumFilter:
         self.msg_count_by_client = {} 
         self.expected_by_client = {}   
         self.received_by_client = {}
+        self.coordinator_by_client = {}
 
         self.lock = threading.Lock()
         self.control_thread = None
@@ -62,8 +67,10 @@ class SumFilter:
             logging.error(f"[SumFilter {ID}] Error stopping control listener: {e}")
 
     def _send_count(self, client_id, count):
-        self.control_sender.send(
-            message_protocol.internal.serialize([MSG_COUNT, client_id, count])
+        coordinator = self.coordinator_by_client[client_id]
+        self.control_sender.send_with_key(
+            f"sum_control.{coordinator}",
+            message_protocol.internal.serialize([MSG_COUNT, client_id, count]),
         )
 
     def _process_data(self, client_id, fruit, amount):
@@ -76,36 +83,54 @@ class SumFilter:
             self.msg_count_by_client[client_id] = (
                 self.msg_count_by_client.get(client_id, 0) + 1
             )
-            if client_id in self.expected_by_client:
+            if client_id in self.coordinator_by_client:
                 self._send_count(client_id, 1)
 
     def _handle_gateway_eof(self, client_id, total_expected):
-        logging.info(
-            f"[SumFilter {ID}] EOF from Gateway, client {client_id}, N={total_expected}"
-        )
+        logging.info(f"[SumFilter {ID}] EOF from Gateway, client {client_id}, N={total_expected}")
         with self.lock:
             self.control_sender.send(
                 message_protocol.internal.serialize(
-                    [MSG_PREPARE, client_id, int(total_expected)]
+                    [MSG_PREPARE, client_id, int(total_expected), ID]
                 )
             )
     
-    def _process_prepare(self, client_id, total_expected):
+    def _process_prepare(self, client_id, total_expected, coordinator):
         with self.lock:
-            self.expected_by_client[client_id] = int(total_expected)
+            self.coordinator_by_client[client_id] = int(coordinator)
             mine = self.msg_count_by_client.get(client_id, 0)
             if mine > 0:
                 self._send_count(client_id, mine)
-                
-            if self.received_by_client.get(client_id, 0) == self.expected_by_client[client_id]:
-                self._flush_data_and_eof(client_id)
+            if int(coordinator) == ID:
+                self.expected_by_client[client_id] = int(total_expected)
+                self._check_ready(client_id)
+
+    def _process_count(self, client_id, count):
+        with self.lock:
+            self.received_by_client[client_id] = (
+                self.received_by_client.get(client_id, 0) + int(count)
+            )
+            self._check_ready(client_id)
+
+    def _check_ready(self, client_id):
+        if client_id not in self.expected_by_client:
+            return
+        if self.received_by_client.get(client_id, 0) == self.expected_by_client[client_id]:
+            self.expected_by_client.pop(client_id)
+            self.received_by_client.pop(client_id, None)
+            self.control_sender.send(
+                message_protocol.internal.serialize([MSG_FLUSH, client_id])
+            )
+
+    def _process_flush(self, client_id):
+        with self.lock:
+            self._flush_data_and_eof(client_id)
 
     def _flush_data_and_eof(self, client_id):
         logging.info(f"[SumFilter {ID}] Flushing client {client_id} to Aggregators")
         client_fruits = self.amount_by_client.pop(client_id, {})
-        self.expected_by_client.pop(client_id, None)
         self.msg_count_by_client.pop(client_id, None)
-        self.received_by_client.pop(client_id, None)
+        self.coordinator_by_client.pop(client_id, None)
 
         for item in client_fruits.values():
             routing_key = f"{client_id}_{item.fruit}"
@@ -115,26 +140,20 @@ class SumFilter:
             )
         for exchange in self.data_output_exchanges:
             exchange.send(message_protocol.internal.serialize([client_id]))
-    
-    def _process_count(self, client_id, count):
-        with self.lock:
-            self.received_by_client[client_id] = (
-                self.received_by_client.get(client_id, 0) + int(count)
-            )
-            if (client_id in self.expected_by_client
-                    and self.received_by_client[client_id] == self.expected_by_client[client_id]):
-                self._flush_data_and_eof(client_id)
+
 
     def process_control_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if fields[0] == MSG_PREPARE:
-            self._process_prepare(fields[1], fields[2])
+            self._process_prepare(fields[1], fields[2], fields[3])
         elif fields[0] == MSG_COUNT:
             self._process_count(fields[1], fields[2])
+        elif fields[0] == MSG_FLUSH:
+            self._process_flush(fields[1])
         ack()
 
 
-    def process_data_messsage(self, message, ack, nack):
+    def process_data_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
         if len(fields) == 3:
             self._process_data(*fields)
@@ -151,7 +170,7 @@ class SumFilter:
             daemon=True,
         )
         self.control_thread.start()
-        self.input_queue.start_consuming(self.process_data_messsage)
+        self.input_queue.start_consuming(self.process_data_message)
 
     def _safe_close(self, resource, name: str) -> None:
         if resource is None:
